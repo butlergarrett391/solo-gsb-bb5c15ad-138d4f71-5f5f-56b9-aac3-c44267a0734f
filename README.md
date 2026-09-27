@@ -11,7 +11,9 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 把同一员工的多条日程在真实 UTC 时间轴上合并为工作段，
 检查相邻工作段之间的休息空档是否低于最低分钟数；
 `POST /common-free-slots` 把每名参与者的忙碌区间合并后取窗口内的共同空闲，
-按**以窗口起点为原点的步长网格**枚举能完整容纳预约的起止时刻。
+按**以窗口起点为原点的步长网格**枚举能完整容纳预约的起止时刻；
+`POST /schedule-changes` 则把同一员工变更前后两版日程各自展开、裁剪到 UTC
+窗口并合并为工作覆盖，对账输出取消与新增的最大连续工作段及真实分钟数。
 
 ## 快速启动（单条命令）
 
@@ -24,7 +26,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`
 
 ## 配置
 
@@ -441,6 +443,80 @@ docker compose up --build
 | `count` | 可用预约槽数 |
 | `slots[].start_utc` / `slots[].end_utc` | 预约槽起止（半开，UTC，Z 结尾），终点 = 起点 + `duration_minutes` |
 
+### `POST /schedule-changes`
+
+对账同一员工**变更前后**两版排班在半开 UTC 窗口
+`[window_start_utc, window_end_utc)`（最长 31 天）内的工作时间差异。
+`before` / `after` 各为**可为空**的日程列表（与 `/overlaps` 单侧参数与校验
+完全一致）；`null`、空列表或缺省均表示该版无排班。两版日程分别按既有
+跳时 / 叠时策略展开为**半开 UTC 工作段** `[start, start+duration)`，
+先**裁剪到窗口**，再各自**合并相交或相接的段**（重复实例不重复计）。
+随后比较两版工作覆盖：取消 = 变更前 − 变更后，新增 = 变更后 − 变更前，
+输出各自的**最大连续区间**、每段真实分钟数与两类总分钟数，均按起点升序。
+**仅实例条目变化而合并后的工作覆盖完全相同时，返回空差异。**
+
+请求体：
+
+```json
+{
+  "window_start_utc": "2026-03-02T00:00:00Z",
+  "window_end_utc": "2026-03-03T00:00:00Z",
+  "before": [
+    {
+      "timezone": "Europe/Berlin",
+      "start_date": "2026-03-02",
+      "end_date": "2026-03-02",
+      "weekdays": [0],
+      "local_time": "09:00",
+      "duration_minutes": 120
+    }
+  ],
+  "after": [
+    {
+      "timezone": "Europe/Berlin",
+      "start_date": "2026-03-02",
+      "end_date": "2026-03-02",
+      "weekdays": [0],
+      "local_time": "10:00",
+      "duration_minutes": 120
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `window_start_utc` / `window_end_utc` | string | 对账窗口起止（半开），UTC ISO 8601 且**以 `Z` 结尾**；须递增且不超过 31 天 |
+| `before` | object[] \| null | 变更前日程列表（与 `/overlaps` 单侧相同）；`null`、空列表或缺省表示无排班 |
+| `after` | object[] \| null | 变更后日程列表，规则同 `before` |
+
+响应 `200`（`cancelled` / `added` 分别按 `start_utc` 升序）：
+
+```json
+{
+  "cancelled_count": 1,
+  "added_count": 1,
+  "cancelled_total_minutes": 60.0,
+  "added_total_minutes": 60.0,
+  "cancelled": [
+    {"start_utc": "2026-03-02T08:00:00Z", "end_utc": "2026-03-02T09:00:00Z", "minutes": 60.0}
+  ],
+  "added": [
+    {"start_utc": "2026-03-02T10:00:00Z", "end_utc": "2026-03-02T11:00:00Z", "minutes": 60.0}
+  ]
+}
+```
+
+上例中柏林 09:00 CET = 08:00 UTC 工作 120 分钟（`[08:00, 10:00)`），
+变更后 10:00 CET = 09:00 UTC 工作 120 分钟（`[09:00, 11:00)`）：
+取消 `[08:00, 09:00)` 60 分钟，新增 `[10:00, 11:00)` 60 分钟。
+
+| 字段 | 说明 |
+| --- | --- |
+| `cancelled_count` / `added_count` | 取消 / 新增的最大连续区间数 |
+| `cancelled_total_minutes` / `added_total_minutes` | 取消 / 新增总分钟数（真实 UTC 流逝） |
+| `cancelled[]` / `added[]` | 差异区间（半开，UTC，Z 结尾）及每段真实分钟数，按起点升序 |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -457,6 +533,9 @@ docker compose up --build
 - `/common-free-slots`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或
   超过 31 天、`duration_minutes` / `step_minutes` 不在 1～1440、
   参与者数不在 1～10，或任一参与者的日程字段校验失败
+  （规则与 `/overlaps` 单侧一致）
+- `/schedule-changes`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或
+  超过 31 天，或 `before` / `after` 中任一日程字段校验失败
   （规则与 `/overlaps` 单侧一致）
 
 ## 判定原理
@@ -479,9 +558,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更对账
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

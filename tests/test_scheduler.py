@@ -14,6 +14,7 @@ from app.scheduler import (
     merge_intervals,
     occupancy_by_day,
     rest_violations,
+    schedule_changes,
     staffing_gaps,
 )
 
@@ -595,3 +596,146 @@ def test_common_free_slots_all_participants_must_be_free():
         ],
     )
     assert slots == []
+
+
+# --- schedule_changes -------------------------------------------------------
+
+
+def test_schedule_changes_basic():
+    # 变更前 [08:00,10:00)；变更后 [09:00,11:00)
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 10))],
+        after_intervals=[(_utc(1, 9), _utc(1, 11))],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9))]
+    assert added == [(_utc(1, 10), _utc(1, 11))]
+
+
+def test_schedule_changes_identical_coverage_empty():
+    # 两版完全相同
+    intervals = [(_utc(1, 8), _utc(1, 9))]
+    assert schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=intervals,
+        after_intervals=intervals,
+    ) == ([], [])
+
+
+def test_schedule_changes_different_entries_same_coverage_empty():
+    # 变更前一条长段，变更后两条相接短段：实例条目不同但覆盖一致 -> 空差异
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 10))],
+        after_intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+    )
+    assert cancelled == []
+    assert added == []
+
+
+def test_schedule_changes_duplicate_overlap_counts_once():
+    # 变更后两个相交实例覆盖 [08:00,09:30)，与变更前 [08:00,09:30) 一致
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 9, 30))],
+        after_intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 8, 30), _utc(1, 9, 30))],
+    )
+    assert cancelled == []
+    assert added == []
+
+
+def test_schedule_changes_clips_to_window_before_diff():
+    # 变更前后都是 [07:00,09:00)，窗口 [08:00, 次日00:00)：裁剪后覆盖一致
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 7), _utc(1, 9))],
+        after_intervals=[(_utc(1, 7), _utc(1, 9))],
+    )
+    assert cancelled == []
+    assert added == []
+
+    # 变更前 [07:00,09:00)，变更后无：仅窗口内的 [08:00,09:00) 记为取消
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 7), _utc(1, 9))],
+        after_intervals=[],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9))]
+    assert added == []
+
+
+def test_schedule_changes_empty_sides():
+    # 变更前无排班 -> 变更后全部记为新增
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[],
+        after_intervals=[(_utc(1, 8), _utc(1, 9))],
+    )
+    assert cancelled == []
+    assert added == [(_utc(1, 8), _utc(1, 9))]
+
+    # 两侧都空
+    assert schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[],
+        after_intervals=[],
+    ) == ([], [])
+
+
+def test_schedule_changes_maximal_segments_sorted():
+    # 变更前三段 08-09 / 10-11 / 12-13；变更后仅 10-11 -> 取消两段，按起点排序
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[
+            (_utc(1, 12), _utc(1, 13)),
+            (_utc(1, 8), _utc(1, 9)),
+            (_utc(1, 10), _utc(1, 11)),
+        ],
+        after_intervals=[(_utc(1, 10), _utc(1, 11))],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9)), (_utc(1, 12), _utc(1, 13))]
+    assert added == []
+
+
+def test_schedule_changes_containment_and_inner_hole():
+    # 变更前连续 [08:00,12:00)；变更后仅保留首尾 [08:00,09:00) 与 [11:00,12:00)
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 12))],
+        after_intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 11), _utc(1, 12))],
+    )
+    assert cancelled == [(_utc(1, 9), _utc(1, 11))]
+    assert added == []
+
+    # 反向：由两段变为一整段 -> 中间 [09:00,11:00) 为新增
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 11), _utc(1, 12))],
+        after_intervals=[(_utc(1, 8), _utc(1, 12))],
+    )
+    assert cancelled == []
+    assert added == [(_utc(1, 9), _utc(1, 11))]
+
+
+def test_schedule_changes_touching_segments_merge_within_version():
+    # 跨版本的相接不相容：各版本内部相接先合并，但 [08:00,09:00) 与
+    # [09:00,10:00) 分属两版时互不覆盖（半开区间相接点不重叠）
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 9))],
+        after_intervals=[(_utc(1, 9), _utc(1, 10))],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9))]
+    assert added == [(_utc(1, 9), _utc(1, 10))]

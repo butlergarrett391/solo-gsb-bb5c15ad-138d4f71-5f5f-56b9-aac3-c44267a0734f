@@ -372,6 +372,70 @@ def common_free_slots(
     return slots
 
 
+def _clip_and_merge(
+    intervals: Iterable[tuple[datetime, datetime]],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """把半开区间裁剪到窗口 [window_start, window_end)，再合并相交或相接者。"""
+    clipped = [
+        (max(start, window_start), min(end, window_end))
+        for start, end in intervals
+    ]
+    return merge_intervals(iv for iv in clipped if iv[0] < iv[1])
+
+
+def _subtract_intervals(
+    base: list[tuple[datetime, datetime]],
+    minus: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """从已合并、按起点排序的半开区间集合 base 中减去 minus 的覆盖。
+
+    返回的最大连续差集区间按起点排序（半开区间相接不相容，故差集各段
+    之间必隔着 minus 的非空覆盖，无需再合并）。
+    """
+    result: list[tuple[datetime, datetime]] = []
+    for start, end in base:
+        cursor = start
+        for m_start, m_end in minus:
+            if m_end <= cursor:  # 已落在当前游标之前
+                continue
+            if m_start >= end:  # 后续区间都在本段之后
+                break
+            if m_start > cursor:  # cursor 到减去段起点之间仍是差集
+                result.append((cursor, m_start))
+            cursor = m_end
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
+def schedule_changes(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    before_intervals: Iterable[tuple[datetime, datetime]],
+    after_intervals: Iterable[tuple[datetime, datetime]],
+) -> tuple[list[tuple[datetime, datetime]], list[tuple[datetime, datetime]]]:
+    """对账同一员工变更前后两版工作时间，返回 (取消段, 新增段)。
+
+    两版半开工作区间分别裁剪到半开窗口 [window_start, window_end)，
+    并各自合并相交或相接者（重复实例不重复计）；取消 = 变更前 − 变更后，
+    新增 = 变更后 − 变更前。两侧均为最大连续区间、按起点排序。
+    仅实例条目变化而合并后的工作覆盖完全相同时，两侧均为空列表。
+    """
+    before = _clip_and_merge(
+        before_intervals, window_start=window_start, window_end=window_end
+    )
+    after = _clip_and_merge(
+        after_intervals, window_start=window_start, window_end=window_end
+    )
+    return _subtract_intervals(before, after), _subtract_intervals(after, before)
+
+
 def utc_iso(dt: datetime) -> str:
     """把 UTC 时刻格式化为 Z 结尾的 ISO 8601 字符串。"""
     return dt.isoformat().replace("+00:00", "Z")

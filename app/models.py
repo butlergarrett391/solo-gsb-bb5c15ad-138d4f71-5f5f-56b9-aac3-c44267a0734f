@@ -256,6 +256,7 @@ class RestViolationsResponse(BaseModel):
 
 
 MAX_FREE_SLOT_WINDOW_DAYS = 31
+MAX_SCHEDULE_CHANGE_WINDOW_DAYS = 31
 
 
 class FreeSlotsParticipant(BaseModel):
@@ -321,4 +322,69 @@ class CommonFreeSlotsResponse(BaseModel):
     count: int = Field(..., description="可用预约槽数")
     slots: list[FreeSlotOut] = Field(
         ..., description="能完整容纳预约的网格起点及对应终点，按起点 UTC 升序"
+    )
+
+
+class ScheduleChangesRequest(BaseModel):
+    """同一员工变更前后两组可为空的日程 + 最长 31 天的 UTC 对账窗口。"""
+
+    window_start_utc: datetime = Field(
+        ..., description="查询窗口起点（含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    window_end_utc: datetime = Field(
+        ..., description="查询窗口终点（不含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    before: list[OverlapSide] | None = Field(
+        default=None,
+        description="变更前日程列表（与 /overlaps 单侧相同）；null 或空列表表示无排班",
+    )
+    after: list[OverlapSide] | None = Field(
+        default=None,
+        description="变更后日程列表（与 /overlaps 单侧相同）；null 或空列表表示无排班",
+    )
+
+    @field_validator("window_start_utc", "window_end_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        """窗口起止必须是以 Z 结尾的 UTC ISO 8601 字符串。"""
+        if isinstance(v, str) and not v.endswith("Z"):
+            raise ValueError("must be an ISO 8601 UTC timestamp ending with 'Z'")
+        return v
+
+    @field_validator("window_start_utc", "window_end_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> "ScheduleChangesRequest":
+        if not self.window_start_utc < self.window_end_utc:
+            raise ValueError("window_start_utc must be before window_end_utc")
+        if self.window_end_utc - self.window_start_utc > timedelta(
+            days=MAX_SCHEDULE_CHANGE_WINDOW_DAYS
+        ):
+            raise ValueError(
+                f"window must not exceed {MAX_SCHEDULE_CHANGE_WINDOW_DAYS} days"
+            )
+        return self
+
+
+class ScheduleChangeOut(BaseModel):
+    start_utc: str = Field(..., description="差异区间起点（含），UTC，Z 结尾")
+    end_utc: str = Field(..., description="差异区间终点（不含），UTC，Z 结尾")
+    minutes: float = Field(..., description="该段真实分钟数（真实 UTC 流逝）")
+
+
+class ScheduleChangesResponse(BaseModel):
+    cancelled_count: int = Field(..., description="取消的最大连续区间数")
+    added_count: int = Field(..., description="新增的最大连续区间数")
+    cancelled_total_minutes: float = Field(..., description="取消总分钟数")
+    added_total_minutes: float = Field(..., description="新增总分钟数")
+    cancelled: list[ScheduleChangeOut] = Field(
+        ..., description="变更前有、变更后无的工作段，按起点 UTC 升序"
+    )
+    added: list[ScheduleChangeOut] = Field(
+        ..., description="变更后有、变更前无的工作段，按起点 UTC 升序"
     )

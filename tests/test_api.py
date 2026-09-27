@@ -1585,3 +1585,387 @@ def test_common_free_slots_reuses_schedule_validation():
         ),
     )
     assert resp.status_code == 422
+
+
+# --- POST /schedule-changes --------------------------------------------------
+
+# 窗口：2026-03-02 全天（UTC）
+CHANGE_WINDOW = {
+    "window_start_utc": "2026-03-02T00:00:00Z",
+    "window_end_utc": "2026-03-03T00:00:00Z",
+}
+
+
+def _change_schedule(local_time: str, duration: int = 60, **overrides) -> dict:
+    schedule = {
+        "timezone": "UTC",
+        "start_date": "2026-03-02",
+        "end_date": "2026-03-02",
+        "weekdays": [0],
+        "local_time": local_time,
+        "duration_minutes": duration,
+    }
+    schedule.update(overrides)
+    return schedule
+
+
+def _change_payload(**overrides):
+    payload = {
+        **CHANGE_WINDOW,
+        "before": [_change_schedule("08:00", 120)],
+        "after": [_change_schedule("09:00", 120)],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_schedule_changes_basic():
+    # 变更前 [08:00,10:00)，变更后 [09:00,11:00)
+    # -> 取消 [08:00,09:00) 60 分钟，新增 [10:00,11:00) 60 分钟
+    resp = client.post("/schedule-changes", json=_change_payload())
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "cancelled_count": 1,
+        "added_count": 1,
+        "cancelled_total_minutes": 60.0,
+        "added_total_minutes": 60.0,
+        "cancelled": [
+            {
+                "start_utc": "2026-03-02T08:00:00Z",
+                "end_utc": "2026-03-02T09:00:00Z",
+                "minutes": 60.0,
+            }
+        ],
+        "added": [
+            {
+                "start_utc": "2026-03-02T10:00:00Z",
+                "end_utc": "2026-03-02T11:00:00Z",
+                "minutes": 60.0,
+            }
+        ],
+    }
+
+
+def test_schedule_changes_identical_empty():
+    schedule = [_change_schedule("08:00")]
+    resp = client.post(
+        "/schedule-changes",
+        json={**CHANGE_WINDOW, "before": schedule, "after": schedule},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "cancelled_count": 0,
+        "added_count": 0,
+        "cancelled_total_minutes": 0.0,
+        "added_total_minutes": 0.0,
+        "cancelled": [],
+        "added": [],
+    }
+
+
+def test_schedule_changes_entries_change_but_coverage_identical_empty():
+    # 变更前一条 120 分钟；变更后两条相接的 60 分钟：仅实例条目变化，覆盖不变
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            **CHANGE_WINDOW,
+            "before": [_change_schedule("08:00", 120)],
+            "after": [_change_schedule("08:00"), _change_schedule("09:00")],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancelled"] == []
+    assert body["added"] == []
+    assert body["cancelled_total_minutes"] == 0.0
+    assert body["added_total_minutes"] == 0.0
+
+
+def test_schedule_changes_null_and_empty_schedules():
+    # before=null -> 变更后全部为新增
+    resp = client.post(
+        "/schedule-changes",
+        json={**CHANGE_WINDOW, "before": None, "after": [_change_schedule("08:00")]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancelled"] == []
+    assert body["added"] == [
+        {
+            "start_utc": "2026-03-02T08:00:00Z",
+            "end_utc": "2026-03-02T09:00:00Z",
+            "minutes": 60.0,
+        }
+    ]
+    assert body["added_total_minutes"] == 60.0
+
+    # after 空列表 -> 变更前全部为取消
+    resp = client.post(
+        "/schedule-changes",
+        json={**CHANGE_WINDOW, "before": [_change_schedule("08:00")], "after": []},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == []
+    assert body["cancelled"] == [
+        {
+            "start_utc": "2026-03-02T08:00:00Z",
+            "end_utc": "2026-03-02T09:00:00Z",
+            "minutes": 60.0,
+        }
+    ]
+    assert body["cancelled_total_minutes"] == 60.0
+
+    # 两版均缺省（无排班）-> 空差异
+    resp = client.post("/schedule-changes", json=CHANGE_WINDOW)
+    assert resp.status_code == 200
+    assert resp.json()["cancelled"] == []
+    assert resp.json()["added"] == []
+
+
+def test_schedule_changes_clips_to_window():
+    # 变更前 03-01 23:00 UTC 起 120 分钟，仅 [00:00,01:00) 在窗口内；
+    # 变更后无排班 -> 取消段裁剪为 [00:00,01:00)
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            **CHANGE_WINDOW,
+            "before": [
+                _change_schedule(
+                    "23:00", 120, start_date="2026-03-01", weekdays=[6]
+                )
+            ],
+            "after": None,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cancelled"] == [
+        {
+            "start_utc": "2026-03-02T00:00:00Z",
+            "end_utc": "2026-03-02T01:00:00Z",
+            "minutes": 60.0,
+        }
+    ]
+
+
+def test_schedule_changes_multiple_segments_sorted_and_totals():
+    # 变更前 08-09 / 10-11 / 12-13 三段；变更后仅保留 10-11
+    # -> 取消两段（按起点排序）共 120 分钟，无新增
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            **CHANGE_WINDOW,
+            "before": [
+                _change_schedule("08:00"),
+                _change_schedule("10:00"),
+                _change_schedule("12:00"),
+            ],
+            "after": [_change_schedule("10:00")],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancelled_count"] == 2
+    assert body["cancelled_total_minutes"] == 120.0
+    assert body["added"] == []
+    assert [c["start_utc"] for c in body["cancelled"]] == [
+        "2026-03-02T08:00:00Z",
+        "2026-03-02T12:00:00Z",
+    ]
+    assert all(c["minutes"] == 60.0 for c in body["cancelled"])
+
+
+def test_schedule_changes_inner_hole_is_maximal_segment():
+    # 变更前连续 [08:00,12:00)（用两段相接表达）；变更后仅首尾各 60 分钟
+    # -> 取消为最大连续段 [09:00,11:00) 120 分钟
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            **CHANGE_WINDOW,
+            "before": [
+                _change_schedule("08:00", 240),
+            ],
+            "after": [_change_schedule("08:00"), _change_schedule("11:00")],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancelled"] == [
+        {
+            "start_utc": "2026-03-02T09:00:00Z",
+            "end_utc": "2026-03-02T11:00:00Z",
+            "minutes": 120.0,
+        }
+    ]
+    assert body["added"] == []
+
+
+def test_schedule_changes_reuses_gap_shift_forward():
+    # 纽约 2026-03-08 02:30 不存在；shift_forward 后 03:30 EDT = 07:30 UTC
+    ny_gap_schedule = {
+        "timezone": "America/New_York",
+        "start_date": "2026-03-08",
+        "end_date": "2026-03-08",
+        "weekdays": [6],
+        "local_time": "02:30",
+        "gap_strategy": "shift_forward",
+        "duration_minutes": 60,
+    }
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            "window_start_utc": "2026-03-08T00:00:00Z",
+            "window_end_utc": "2026-03-09T00:00:00Z",
+            "before": [ny_gap_schedule],
+            "after": None,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cancelled"] == [
+        {
+            "start_utc": "2026-03-08T07:30:00Z",
+            "end_utc": "2026-03-08T08:30:00Z",
+            "minutes": 60.0,
+        }
+    ]
+
+    # 同参数但 skip 策略：该实例被跳过，两版均无覆盖 -> 空差异
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            "window_start_utc": "2026-03-08T00:00:00Z",
+            "window_end_utc": "2026-03-09T00:00:00Z",
+            "before": [{**ny_gap_schedule, "gap_strategy": "skip"}],
+            "after": None,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cancelled"] == []
+    assert resp.json()["added"] == []
+
+
+def test_schedule_changes_reuses_fold_merging():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC）：
+    # fold=both 各 60 分钟相接 -> 合并为 [05:30,07:30)；
+    # fold=first 单次 120 分钟也是 [05:30,07:30)：实例条目不同、覆盖一致 -> 空差异
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            "window_start_utc": "2026-11-01T00:00:00Z",
+            "window_end_utc": "2026-11-02T00:00:00Z",
+            "before": [
+                {
+                    "timezone": "America/New_York",
+                    "start_date": "2026-11-01",
+                    "end_date": "2026-11-01",
+                    "weekdays": [6],
+                    "local_time": "01:30",
+                    "fold_strategy": "both",
+                    "duration_minutes": 60,
+                }
+            ],
+            "after": [
+                {
+                    "timezone": "America/New_York",
+                    "start_date": "2026-11-01",
+                    "end_date": "2026-11-01",
+                    "weekdays": [6],
+                    "local_time": "01:30",
+                    "fold_strategy": "first",
+                    "duration_minutes": 120,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancelled"] == []
+    assert body["added"] == []
+
+
+def test_schedule_changes_window_must_be_z_utc_422():
+    resp = client.post(
+        "/schedule-changes", json=_change_payload(window_start_utc="2026-03-02T00:00:00")
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(window_end_utc="2026-03-03T00:00:00+00:00"),
+    )
+    assert resp.status_code == 422
+
+
+def test_schedule_changes_window_not_increasing_422():
+    # 相等与逆序都非法
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(window_end_utc="2026-03-02T00:00:00Z"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(
+            window_start_utc="2026-03-03T00:00:00Z",
+            window_end_utc="2026-03-02T00:00:00Z",
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_schedule_changes_window_over_31_days_422():
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(
+            window_start_utc="2026-01-01T00:00:00Z",
+            window_end_utc="2026-02-02T00:00:00Z",  # 32 天
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_schedule_changes_window_exactly_31_days_ok():
+    resp = client.post(
+        "/schedule-changes",
+        json={
+            "window_start_utc": "2026-01-01T00:00:00Z",
+            "window_end_utc": "2026-02-01T00:00:00Z",  # 恰好 31 天
+            "before": None,
+            "after": None,
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_schedule_changes_reuses_schedule_validation():
+    # 日程沿用 /overlaps 单侧校验：非法时区 / 时长越界 / 区间超 366 天均 422
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(
+            before=[{**STAFF_SCHED_BERLIN, "timezone": "Not/AZone"}]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(
+            after=[{**STAFF_SCHED_BERLIN, "duration_minutes": 0}]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/schedule-changes",
+        json=_change_payload(
+            before=[
+                {
+                    **STAFF_SCHED_BERLIN,
+                    "start_date": "2026-01-01",
+                    "end_date": "2027-01-03",
+                }
+            ]
+        ),
+    )
+    assert resp.status_code == 422
