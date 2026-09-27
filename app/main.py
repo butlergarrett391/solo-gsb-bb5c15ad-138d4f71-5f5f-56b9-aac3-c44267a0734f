@@ -20,6 +20,9 @@ from .models import (
     RestViolationOut,
     RestViolationsRequest,
     RestViolationsResponse,
+    ScheduleChangeOut,
+    ScheduleChangesRequest,
+    ScheduleChangesResponse,
     StaffingGapOut,
     StaffingGapsRequest,
     StaffingGapsResponse,
@@ -31,6 +34,7 @@ from .scheduler import (
     instance_payload,
     occupancy_by_day,
     rest_violations,
+    schedule_changes,
     staffing_gaps,
     utc_iso,
 )
@@ -45,7 +49,8 @@ app = FastAPI(
         "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用，"
         "按 UTC 窗口扫描多员工在岗人数缺口，"
         "检查同一员工相邻工作段之间的休息是否低于最低分钟数，"
-        "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽。"
+        "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽，"
+        "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间。"
     ),
 )
 
@@ -261,4 +266,59 @@ def common_free_slots_check(req: CommonFreeSlotsRequest) -> CommonFreeSlotsRespo
             FreeSlotOut(start_utc=utc_iso(start), end_utc=utc_iso(end))
             for start, end in slots
         ],
+    )
+
+
+@app.post(
+    "/schedule-changes",
+    response_model=ScheduleChangesResponse,
+    summary="对账同一员工变更前后的排班差异",
+)
+def schedule_changes_check(req: ScheduleChangesRequest) -> ScheduleChangesResponse:
+    # 变更前后两版日程各自按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    versions: list[list[tuple[datetime, datetime]]] = []
+    for sides in (req.before, req.after):
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in sides or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        versions.append(intervals)
+    cancelled, added = schedule_changes(
+        window_start=req.window_start_utc,
+        window_end=req.window_end_utc,
+        before_intervals=versions[0],
+        after_intervals=versions[1],
+    )
+
+    def _payload(
+        segments: list[tuple[datetime, datetime]],
+    ) -> list[ScheduleChangeOut]:
+        return [
+            ScheduleChangeOut(
+                start_utc=utc_iso(start),
+                end_utc=utc_iso(end),
+                minutes=(end - start).total_seconds() / 60,
+            )
+            for start, end in segments
+        ]
+
+    cancelled_out = _payload(cancelled)
+    added_out = _payload(added)
+    return ScheduleChangesResponse(
+        cancelled_count=len(cancelled_out),
+        cancelled_total_minutes=sum(c.minutes for c in cancelled_out),
+        cancelled=cancelled_out,
+        added_count=len(added_out),
+        added_total_minutes=sum(a.minutes for a in added_out),
+        added=added_out,
     )

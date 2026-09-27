@@ -11,9 +11,11 @@ from app.scheduler import (
     common_free_slots,
     expand_schedule,
     find_overlaps,
+    interval_difference,
     merge_intervals,
     occupancy_by_day,
     rest_violations,
+    schedule_changes,
     staffing_gaps,
 )
 
@@ -595,3 +597,97 @@ def test_common_free_slots_all_participants_must_be_free():
         ],
     )
     assert slots == []
+
+
+# --- interval_difference / schedule_changes ---------------------------------
+
+
+def test_interval_difference_basic():
+    # base [08:00,12:00) 挖去 [09:00,10:00) -> 两段最大连续区间
+    assert interval_difference(
+        [(_utc(1, 8), _utc(1, 12))],
+        [(_utc(1, 9), _utc(1, 10))],
+    ) == [(_utc(1, 8), _utc(1, 9)), (_utc(1, 10), _utc(1, 12))]
+
+
+def test_interval_difference_merges_and_splits_unsorted_input():
+    # 两侧输入均无需有序；base 内相交/相接段先合并，subtract 同样先合并
+    assert interval_difference(
+        [(_utc(1, 10), _utc(1, 12)), (_utc(1, 8), _utc(1, 10))],  # 相接 -> [08:00,12:00)
+        [(_utc(1, 9), _utc(1, 9, 30)), (_utc(1, 9, 30), _utc(1, 10))],  # -> [09:00,10:00)
+    ) == [(_utc(1, 8), _utc(1, 9)), (_utc(1, 10), _utc(1, 12))]
+
+
+def test_interval_difference_touching_subtract_keeps_base_whole():
+    # 半开区间：subtract 与 base 边界相接不挖去任何部分
+    assert interval_difference(
+        [(_utc(1, 8), _utc(1, 10))],
+        [(_utc(1, 10), _utc(1, 11)), (_utc(1, 7), _utc(1, 8))],
+    ) == [(_utc(1, 8), _utc(1, 10))]
+
+
+def test_interval_difference_containment_and_cover():
+    # subtract 完全包含 base -> 空；subtract 被 base 包含 -> 两段
+    assert (
+        interval_difference(
+            [(_utc(1, 8), _utc(1, 9))],
+            [(_utc(1, 7), _utc(1, 10))],
+        )
+        == []
+    )
+    assert interval_difference([], [(_utc(1, 8), _utc(1, 9))]) == []
+    assert interval_difference([(_utc(1, 8), _utc(1, 9))], []) == [
+        (_utc(1, 8), _utc(1, 9))
+    ]
+
+
+def test_schedule_changes_clips_to_window_and_compares():
+    # 窗口 [08:00, 20:00)：变更前 [07:00,10:00)（越界裁剪），变更后 [09:00,11:00)
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 20),
+        before_intervals=[(_utc(1, 7), _utc(1, 10))],
+        after_intervals=[(_utc(1, 9), _utc(1, 11))],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9))]
+    assert added == [(_utc(1, 10), _utc(1, 11))]
+
+
+def test_schedule_changes_same_coverage_empty_diff():
+    # 仅实例条目变化：一段 120 分钟 vs 两段相接 60 分钟 -> 覆盖相同，无差异
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        before_intervals=[(_utc(1, 8), _utc(1, 10))],
+        after_intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+    )
+    assert cancelled == []
+    assert added == []
+
+
+def test_schedule_changes_empty_sides():
+    # 变更前为空 -> 全部为新增；变更后为空 -> 全部为取消；均空 -> 无差异
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        before_intervals=[],
+        after_intervals=[(_utc(1, 8), _utc(1, 9))],
+    )
+    assert cancelled == []
+    assert added == [(_utc(1, 8), _utc(1, 9))]
+
+    cancelled, added = schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        before_intervals=[(_utc(1, 8), _utc(1, 9))],
+        after_intervals=[],
+    )
+    assert cancelled == [(_utc(1, 8), _utc(1, 9))]
+    assert added == []
+
+    assert schedule_changes(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        before_intervals=[],
+        after_intervals=[],
+    ) == ([], [])
